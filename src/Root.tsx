@@ -1,17 +1,17 @@
-import "./index.css";
-import { Composition } from "remotion";
-import { MyComposition } from "./Composition";
+import { Composition } from 'remotion';
+import { PhysicsScene } from './PhysicsScene';
+import './index.css'; // 重要
 
 export const RemotionRoot: React.FC = () => {
   return (
     <>
       <Composition
-        id="MyComp"
-        component={MyComposition}
-        durationInFrames={60}
+        id="PhysicsSimulation"
+        component={PhysicsScene}
+        durationInFrames={450} // 15秒
         fps={30}
-        width={1280}
-        height={720}
+        width={1080}
+        height={1920}
       />
     </>
   );
