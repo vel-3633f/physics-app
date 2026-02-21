@@ -1,123 +1,237 @@
 import { AbsoluteFill, useCurrentFrame, useVideoConfig } from "remotion";
 import React, { useEffect, useRef, useMemo } from "react";
 import Matter from "matter-js";
-import seedrandom from "seedrandom";
 import "./index.css";
 
-const GOAL_THRESHOLD = 25; // 先にこの数ゴールに入れたチームの勝ち
-const GOAL_ZONE_HEIGHT = 80; // 画面下端からこの高さをゴールとする
-
-type Team = "red" | "blue";
+type CollisionEvent = {
+  frame: number;
+  platformIndex: number;
+  velocity: number;
+};
 
 type FrameSnapshot = {
   bodies: {
     vertices: { x: number; y: number }[];
     fillStyle: string;
-    team?: Team;
+    isBall?: boolean;
   }[];
-  redInGoal: number;
-  blueInGoal: number;
-  winner: Team | null;
+  collisions: CollisionEvent[];
+  ballY: number;
+  virtualBallY: number;
+};
+
+const _createSlopes = () => {
+  const platforms: Matter.Body[] = [];
+  const segmentWidth = 300;
+  const numSegments = 25;
+  
+  const baseAngle = 35 * (Math.PI / 180);
+  const baseSlopeRatio = Math.tan(baseAngle);
+  const startX = 0;
+  const startY = 100;
+  const waveAmplitude = 40;
+  const wavelength = 600;
+
+  for (let i = 0; i < numSegments; i++) {
+    const x1 = startX + i * segmentWidth;
+    const x2 = startX + (i + 1) * segmentWidth;
+    
+    const baseY1 = startY + x1 * baseSlopeRatio;
+    const waveOffset1 = waveAmplitude * Math.sin((x1 / wavelength) * Math.PI * 2);
+    const y1 = baseY1 + waveOffset1;
+    
+    const baseY2 = startY + x2 * baseSlopeRatio;
+    const waveOffset2 = waveAmplitude * Math.sin((x2 / wavelength) * Math.PI * 2);
+    const y2 = baseY2 + waveOffset2;
+    
+    const centerX = (x1 + x2) / 2;
+    const centerY = (y1 + y2) / 2;
+    const localAngle = Math.atan2(y2 - y1, x2 - x1);
+    const segmentLength = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+
+    const slope = Matter.Bodies.rectangle(
+      centerX,
+      centerY,
+      segmentLength + 5,
+      30,
+      {
+        isStatic: true,
+        render: { fillStyle: "#8B4513" },
+        friction: 0.5,
+        angle: localAngle,
+      }
+    );
+    (slope as Matter.Body & { platformIndex: number }).platformIndex = i;
+    platforms.push(slope);
+  }
+
+  return platforms;
+};
+
+const _synthesizeBounceSound = (
+  velocity: number,
+  duration: number,
+  sampleRate: number,
+): Float32Array => {
+  const samples = Math.floor(duration * sampleRate);
+  const buffer = new Float32Array(samples);
+  const frequency = 200 + velocity * 50;
+
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const envelope = Math.exp(-8 * t);
+    const sound = Math.sin(2 * Math.PI * frequency * t * (1 - t * 2));
+    buffer[i] = envelope * sound * 0.4;
+  }
+
+  return buffer;
 };
 
 export const PhysicsScene: React.FC = () => {
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
-  const frameSnapshots = useMemo<FrameSnapshot[]>(() => {
-    const rng = seedrandom("hello-tailwind");
+  const { frameSnapshots, allCollisions } = useMemo(() => {
     const engine = Matter.Engine.create();
+    engine.gravity.y = 2.0;
+    engine.timing.timeScale = 1;
     const bodies: Matter.Body[] = [];
 
     bodies.push(
-      Matter.Bodies.rectangle(width / 2, height, width, 50, { isStatic: true }),
-      Matter.Bodies.rectangle(0, height / 2, 50, height, { isStatic: true }),
-      Matter.Bodies.rectangle(width, height / 2, 50, height, {
+      Matter.Bodies.rectangle(width / 2, 10000, width, 50, {
         isStatic: true,
+        render: { fillStyle: "#333" },
+      }),
+      Matter.Bodies.rectangle(-25, 2500, 50, 5000, {
+        isStatic: true,
+        render: { fillStyle: "#333" },
+      }),
+      Matter.Bodies.rectangle(width + 25, 2500, 50, 5000, {
+        isStatic: true,
+        render: { fillStyle: "#333" },
       }),
     );
 
-    // 障害物
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c <= r; c++) {
-        const x = width / 2 - (r * 60) / 2 + c * 60;
-        const y = 500 + r * 60;
-        bodies.push(
-          Matter.Bodies.circle(x, y, 8, {
-            isStatic: true,
-            render: { fillStyle: "#eee" },
-          }),
-        );
-      }
-    }
+    const platforms = _createSlopes();
+    bodies.push(...platforms);
 
-    // ボール：赤チーム vs 青チーム（レース用）
-    const goalY = height - GOAL_ZONE_HEIGHT;
-    const redColor = "#F87171";
-    const blueColor = "#60A5FA";
-    for (let i = 0; i < 250; i++) {
-      const team: Team = i % 2 === 0 ? "red" : "blue";
-      const x = width / 2 + (rng() - 0.5) * 40;
-      const y = -i * 30 - 100;
-      const body = Matter.Bodies.circle(x, y, 12, {
-        restitution: 0.9,
-        render: {
-          fillStyle: team === "red" ? redColor : blueColor,
-        },
-      });
-      (body as Matter.Body & { team: Team }).team = team;
-      bodies.push(body);
-    }
+    const ball = Matter.Bodies.circle(100, 50, 35, {
+      restitution: 0.7,
+      friction: 0.1,
+      density: 0.008,
+      slop: 0.05,
+      render: { fillStyle: "#9333EA" },
+    });
+    Matter.Body.setVelocity(ball, { x: 5, y: 2 });
+    (ball as Matter.Body & { isBall: boolean }).isBall = true;
+    bodies.push(ball);
 
     Matter.World.add(engine.world, bodies);
 
-    const snapshots: FrameSnapshot[] = [];
-    const dt = 1000 / fps;
-    let decidedWinner: Team | null = null;
+    const collisions: CollisionEvent[] = [];
+    const collisionMap = new Map<string, number>();
 
-    for (let f = 0; f < durationInFrames; f++) {
-      const allBodies = Matter.Composite.allBodies(engine.world);
-      let redInGoal = 0;
-      let blueInGoal = 0;
+    Matter.Events.on(engine, "collisionStart", (event) => {
+      event.pairs.forEach((pair) => {
+        const bodyA = pair.bodyA as Matter.Body & {
+          isBall?: boolean;
+          platformIndex?: number;
+        };
+        const bodyB = pair.bodyB as Matter.Body & {
+          isBall?: boolean;
+          platformIndex?: number;
+        };
 
-      const snapshotBodies = allBodies.map((body) => {
-        const team = (body as Matter.Body & { team?: Team }).team;
-        const vertices = body.vertices.map((v) => ({ x: v.x, y: v.y }));
-        const fillStyle = body.render.fillStyle || "#fff";
+        let ballBody: typeof bodyA | null = null;
+        let platformBody: typeof bodyA | null = null;
 
-        if (team === "red" || team === "blue") {
-          const centerY =
-            vertices.reduce((s, v) => s + v.y, 0) / vertices.length;
-          if (centerY >= goalY) {
-            if (team === "red") redInGoal++;
-            else blueInGoal++;
+        if (bodyA.isBall && bodyB.platformIndex !== undefined) {
+          ballBody = bodyA;
+          platformBody = bodyB;
+        } else if (bodyB.isBall && bodyA.platformIndex !== undefined) {
+          ballBody = bodyB;
+          platformBody = bodyA;
+        }
+
+        if (ballBody && platformBody) {
+          const key = `${currentFrame}-${platformBody.platformIndex}`;
+          if (!collisionMap.has(key)) {
+            collisionMap.set(key, 1);
+            const velocity = Math.abs(ballBody.velocity.y);
+            collisions.push({
+              frame: currentFrame,
+              platformIndex: platformBody.platformIndex!,
+              velocity,
+            });
           }
         }
+      });
+    });
+
+    const snapshots: FrameSnapshot[] = [];
+    const dt = 1000 / fps;
+    let currentFrame = 0;
+
+    for (let f = 0; f < durationInFrames; f++) {
+      currentFrame = f;
+
+      Matter.Engine.update(engine, dt / 2);
+      Matter.Engine.update(engine, dt / 2);
+
+      const allBodies = Matter.Composite.allBodies(engine.world);
+
+      const snapshotBodies = allBodies.map((body) => {
+        const bodyWithFlags = body as Matter.Body & { isBall?: boolean };
+        const vertices = body.vertices.map((v) => ({ x: v.x, y: v.y }));
+        const fillStyle = body.render.fillStyle || "#fff";
 
         return {
           vertices,
           fillStyle,
-          ...(team && { team }),
+          isBall: bodyWithFlags.isBall,
         };
       });
 
-      if (decidedWinner === null) {
-        if (redInGoal >= GOAL_THRESHOLD) decidedWinner = "red";
-        else if (blueInGoal >= GOAL_THRESHOLD) decidedWinner = "blue";
-      }
-
       snapshots.push({
         bodies: snapshotBodies,
-        redInGoal,
-        blueInGoal,
-        winner: decidedWinner,
+        collisions: [],
+        ballY: ball.position.y,
+        virtualBallY: ball.position.x,
       });
-      Matter.Engine.update(engine, dt);
     }
 
-    return snapshots;
+    return { frameSnapshots: snapshots, allCollisions: collisions };
   }, [width, height, fps, durationInFrames]);
+
+  useEffect(() => {
+    const collisionsAtFrame = allCollisions.filter((c) => c.frame === frame);
+    if (collisionsAtFrame.length > 0 && typeof window !== "undefined") {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext();
+      }
+
+      collisionsAtFrame.forEach((collision) => {
+        const ctx = audioContextRef.current!;
+        const sampleRate = ctx.sampleRate;
+        const duration = 0.3;
+
+        const audioBuffer = _synthesizeBounceSound(
+          collision.velocity,
+          duration,
+          sampleRate,
+        );
+        const buffer = ctx.createBuffer(1, audioBuffer.length, sampleRate);
+        buffer.copyToChannel(audioBuffer, 0);
+
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start(ctx.currentTime);
+      });
+    }
+  }, [frame, allCollisions]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -128,49 +242,83 @@ export const PhysicsScene: React.FC = () => {
     const snapshot = frameSnapshots[Math.min(frame, frameSnapshots.length - 1)];
     if (!snapshot) return;
 
-    ctx.clearRect(0, 0, width, height);
+    const cameraX = snapshot.virtualBallY - width / 2;
+    const cameraY = snapshot.ballY - height * 0.4;
 
-    snapshot.bodies.forEach(({ vertices, fillStyle }) => {
+    const gradient = ctx.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, "#1a1a2e");
+    gradient.addColorStop(1, "#0f0f1e");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.save();
+    ctx.translate(-cameraX, -cameraY);
+
+    snapshot.bodies.forEach(({ vertices, fillStyle, isBall }) => {
       if (vertices.length === 0) return;
-      const maxY = Math.max(...vertices.map((v) => v.y));
-      if (maxY < 0) return;
 
-      ctx.beginPath();
-      ctx.moveTo(vertices[0].x, vertices[0].y);
-      for (let j = 1; j < vertices.length; j++) {
-        ctx.lineTo(vertices[j].x, vertices[j].y);
+      if (isBall) {
+        const centerX = vertices.reduce((s, v) => s + v.x, 0) / vertices.length;
+        const centerY = vertices.reduce((s, v) => s + v.y, 0) / vertices.length;
+        const radius = Math.sqrt(
+          Math.pow(vertices[0].x - centerX, 2) +
+            Math.pow(vertices[0].y - centerY, 2),
+        );
+
+        ctx.save();
+        ctx.shadowColor = "rgba(147, 51, 234, 0.6)";
+        ctx.shadowBlur = 20;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 10;
+
+        const ballGradient = ctx.createRadialGradient(
+          centerX - radius * 0.3,
+          centerY - radius * 0.3,
+          radius * 0.1,
+          centerX,
+          centerY,
+          radius,
+        );
+        ballGradient.addColorStop(0, "#E9D5FF");
+        ballGradient.addColorStop(0.3, "#C084FC");
+        ballGradient.addColorStop(1, "#7C3AED");
+        ctx.fillStyle = ballGradient;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore();
+
+        ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
+        ctx.beginPath();
+        ctx.arc(
+          centerX - radius * 0.4,
+          centerY - radius * 0.4,
+          radius * 0.25,
+          0,
+          Math.PI * 2,
+        );
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(vertices[0].x, vertices[0].y);
+        for (let j = 1; j < vertices.length; j++) {
+          ctx.lineTo(vertices[j].x, vertices[j].y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = fillStyle;
+        ctx.fill();
+
+        if (fillStyle === "#8B4513") {
+          ctx.strokeStyle = "#654321";
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
       }
-      ctx.closePath();
-      ctx.fillStyle = fillStyle;
-      ctx.fill();
     });
 
-    // ゴールゾーン：左半分は赤・右半分は青の帯で「どっちの陣地か」が一目でわかるように
-    const goalY = height - GOAL_ZONE_HEIGHT;
-    const half = width / 2;
-    ctx.fillStyle = "rgba(248, 113, 113, 0.35)";
-    ctx.fillRect(0, goalY, half, GOAL_ZONE_HEIGHT);
-    ctx.fillStyle = "rgba(96, 165, 250, 0.35)";
-    ctx.fillRect(half, goalY, half, GOAL_ZONE_HEIGHT);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
-    ctx.lineWidth = 3;
-    ctx.strokeRect(0, goalY, width, GOAL_ZONE_HEIGHT);
-    ctx.beginPath();
-    ctx.moveTo(half, goalY);
-    ctx.lineTo(half, goalY + GOAL_ZONE_HEIGHT);
-    ctx.stroke();
-    // 「GOAL」ラベル
-    ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
-    ctx.font = "bold 28px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("GOAL", width / 2, goalY + GOAL_ZONE_HEIGHT / 2 + 10);
+    ctx.restore();
   }, [frame, width, height, frameSnapshots]);
-
-  const currentSnapshot =
-    frameSnapshots[Math.min(frame, frameSnapshots.length - 1)];
-  const redInGoal = currentSnapshot?.redInGoal ?? 0;
-  const blueInGoal = currentSnapshot?.blueInGoal ?? 0;
-  const winner = currentSnapshot?.winner ?? null;
 
   return (
     <AbsoluteFill className="bg-zinc-900 flex justify-center items-center">
@@ -180,71 +328,6 @@ export const PhysicsScene: React.FC = () => {
         height={height}
         className="absolute inset-0"
       />
-
-      <div className="absolute top-32 text-center w-full z-10">
-        <h1 className="text-8xl font-black text-white drop-shadow-2xl tracking-tighter">
-          PHYSICS<span className="text-blue-500">.JS</span>
-        </h1>
-        <div className="mt-4 bg-white/10 backdrop-blur-md inline-block px-6 py-2 rounded-full border border-white/20">
-          <p className="text-3xl text-gray-200 font-bold font-mono">
-            Frame: <span className="text-yellow-400">{frame}</span>
-          </p>
-        </div>
-      </div>
-
-      {/* レース: 赤 vs 青 スコア（ゴール上の見やすいパネル） */}
-      <div className="absolute left-0 right-0 z-10 flex justify-center gap-20 px-6">
-        <div
-          className="rounded-2xl px-10 py-5 text-center shadow-2xl border-4 border-red-400 bg-red-600/90 backdrop-blur-sm"
-          style={{ bottom: GOAL_ZONE_HEIGHT + 24 }}
-        >
-          <p className="text-red-100 text-xs font-bold uppercase tracking-widest mb-1">
-            赤チーム
-          </p>
-          <p className="text-5xl font-black text-white tabular-nums leading-none">
-            {redInGoal}
-            <span className="text-2xl font-bold text-red-200">
-              /{GOAL_THRESHOLD}
-            </span>
-          </p>
-          <p className="text-red-200/90 text-sm mt-1">ゴールに入った数</p>
-        </div>
-        <div
-          className="rounded-2xl px-10 py-5 text-center shadow-2xl border-4 border-blue-400 bg-blue-600/90 backdrop-blur-sm"
-          style={{ bottom: GOAL_ZONE_HEIGHT + 24 }}
-        >
-          <p className="text-blue-100 text-xs font-bold uppercase tracking-widest mb-1">
-            青チーム
-          </p>
-          <p className="text-5xl font-black text-white tabular-nums leading-none">
-            {blueInGoal}
-            <span className="text-2xl font-bold text-blue-200">
-              /{GOAL_THRESHOLD}
-            </span>
-          </p>
-          <p className="text-blue-200/90 text-sm mt-1">ゴールに入った数</p>
-        </div>
-      </div>
-
-      {/* 勝者表示：目立つバナー */}
-      {winner && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
-          <div
-            className={`w-full max-w-2xl mx-6 py-8 rounded-3xl border-4 shadow-2xl text-center ${
-              winner === "red"
-                ? "bg-red-600 border-red-300 text-white"
-                : "bg-blue-600 border-blue-300 text-white"
-            }`}
-          >
-            <p className="text-2xl font-bold opacity-90 mb-1">
-              {winner === "red" ? "赤チーム" : "青チーム"}の勝ち！
-            </p>
-            <p className="text-6xl md:text-7xl font-black uppercase tracking-widest drop-shadow-lg">
-              {winner} wins!
-            </p>
-          </div>
-        </div>
-      )}
     </AbsoluteFill>
   );
 };

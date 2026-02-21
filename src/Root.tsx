@@ -8,7 +8,7 @@ export const RemotionRoot: React.FC = () => {
       <Composition
         id="PhysicsSimulation"
         component={PhysicsScene}
-        durationInFrames={450} // 15秒
+        durationInFrames={900} // 30秒
         fps={30}
         width={1080}
         height={1920}
